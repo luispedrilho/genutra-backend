@@ -149,8 +149,15 @@ app.post('/gerar-plano', authenticateJWT, async (req, res) => {
     return res.status(400).json({ error: 'Dados de anamnese incompletos.' });
   }
   try {
-    // Novo prompt para JSON estruturado
-    const prompt = `Gere um plano alimentar diário para o paciente abaixo, respondendo em JSON com os seguintes campos: resumo, tabela (array de refeições com os campos refeicao, alimentos, observacoes), recomendacoes e notas. Não escreva nada fora do JSON.\n\nDados do paciente:\n${JSON.stringify(anamnese, null, 2)}`;
+    // Novo prompt para JSON estruturado com horários
+    const prompt = `Gere um plano alimentar diário para o paciente abaixo, respondendo em JSON com os seguintes campos: resumo, tabela (array de refeições com os campos refeicao, horario, alimentos, observacoes), recomendacoes e notas. 
+
+IMPORTANTE: Para cada refeição na tabela, inclua um campo "horario" com um horário sugerido no formato "HH:MM" (ex: "08:00", "12:30", "15:00", "19:00"). Os horários devem ser realistas e adequados ao estilo de vida do paciente.
+
+Não escreva nada fora do JSON.
+
+Dados do paciente:
+${JSON.stringify(anamnese, null, 2)}`;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -309,19 +316,19 @@ app.get('/planos/recentes', authenticateJWT, async (req, res) => {
   const limit = parseInt(req.query.limit) || 5;
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const { data, error } = await supabase
+    const { data, error, count } = await supabase
       .from('planos')
-      .select('*')
+      .select('*', { count: 'exact' })
       .eq('user_id', user_id)
       .order('data', { ascending: false })
       .range(offset, offset + limit - 1);
     if (error) return res.status(400).json({ error: error.message });
-    // Total de planos para paginação
-    const { count } = await supabase
+    // Buscar total de planos para paginação
+    const { count: totalCount } = await supabase
       .from('planos')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', user_id);
-    return res.json({ planos: data, total: count });
+    return res.json({ planos: data, total: totalCount });
   } catch (err) {
     return res.status(500).json({ error: 'Erro ao buscar planos recentes.' });
   }
