@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { OpenAI } = require('openai');
+const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 app.use(cors());
@@ -13,6 +14,9 @@ app.use(express.json());
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET || 'genutra-secret';
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Cliente do Google OAuth
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Testa conexão ao iniciar
 async function testConnection() {
@@ -84,6 +88,116 @@ app.post('/login', async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
+
+// Endpoint de autenticação com Google
+app.post('/auth/google', async (req, res) => {
+  const { id_token, user } = req.body;
+  
+  if (!id_token || !user) {
+    return res.status(400).json({ error: 'Token do Google e dados do usuário são obrigatórios.' });
+  }
+
+  try {
+    // Verificar o token do Google
+    const ticket = await googleClient.verifyIdToken({
+      idToken: id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    if (!payload) {
+      return res.status(401).json({ error: 'Token do Google inválido.' });
+    }
+
+    const googleId = payload.sub;
+    const email = payload.email;
+    const name = payload.name;
+    const picture = payload.picture;
+
+    // Verificar se o usuário já existe
+    let { data: existingUser, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (userError && userError.code !== 'PGRST116') {
+      return res.status(500).json({ error: 'Erro ao verificar usuário existente.' });
+    }
+
+    if (!existingUser) {
+      // Criar novo usuário
+      try {
+        // Criar usuário no Auth do Supabase
+        const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+          email,
+          email_confirm: true,
+          user_metadata: {
+            google_id: googleId,
+            picture: picture,
+          }
+        });
+
+        if (authError) {
+          return res.status(400).json({ error: authError.message });
+        }
+
+        const uuid = authData.user.id;
+
+        // Inserir na tabela users
+        const { data: newUser, error: insertError } = await supabase
+          .from('users')
+          .insert([
+            {
+              name: name,
+              email: email,
+              uuid: uuid,
+              google_id: googleId,
+              picture: picture,
+              profession: 'Nutricionista', // Default
+              cpf_cnpj: '00000000000', // Default para usuários Google
+            }
+          ])
+          .select('*')
+          .single();
+
+        if (insertError) {
+          return res.status(400).json({ error: insertError.message });
+        }
+
+        existingUser = newUser;
+      } catch (err) {
+        return res.status(500).json({ error: 'Erro ao criar usuário.' });
+      }
+    }
+
+    // Gerar JWT
+    const token = jwt.sign(
+      { 
+        id: existingUser.uuid, 
+        email: existingUser.email, 
+        name: existingUser.name,
+        google_id: googleId 
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      user: {
+        id: existingUser.uuid,
+        name: existingUser.name,
+        email: existingUser.email,
+        picture: existingUser.picture,
+      },
+      token
+    });
+
+  } catch (err) {
+    console.error('Erro na autenticação Google:', err);
+    return res.status(500).json({ error: 'Erro na autenticação com Google.' });
   }
 });
 
@@ -245,6 +359,102 @@ app.get('/plano/:id', authenticateJWT, async (req, res) => {
     return res.json({ plano: data });
   } catch (err) {
     return res.status(500).json({ error: 'Erro ao buscar plano.' });
+  }
+});
+
+// Endpoint para atualizar um plano específico
+app.put('/plano/:id', authenticateJWT, async (req, res) => {
+  const user_id = req.user.id;
+  const plano_id = req.params.id;
+  const anamnese = req.body;
+  
+  if (!anamnese || !anamnese.nome || !anamnese.objetivo) {
+    return res.status(400).json({ error: 'Dados de anamnese incompletos.' });
+  }
+  
+  try {
+    // Verificar se o plano existe e pertence ao usuário
+    const { data: planoExistente, error: buscaError } = await supabase
+      .from('planos')
+      .select('id')
+      .eq('id', plano_id)
+      .eq('user_id', user_id)
+      .single();
+      
+    if (buscaError || !planoExistente) {
+      return res.status(404).json({ error: 'Plano não encontrado.' });
+    }
+    
+    // Atualizar apenas a anamnese do plano
+    const { data: planoAtualizado, error: updateError } = await supabase
+      .from('planos')
+      .update({
+        paciente: anamnese.nome,
+        objetivo: anamnese.objetivo,
+        anamnese: anamnese,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', plano_id)
+      .eq('user_id', user_id)
+      .select('*')
+      .single();
+      
+    if (updateError) {
+      console.error('❌ Erro ao atualizar plano:', updateError);
+      return res.status(400).json({ error: updateError.message });
+    }
+    
+    return res.json({ plano: planoAtualizado, message: 'Plano atualizado com sucesso!' });
+  } catch (err) {
+    console.error('Erro ao atualizar plano:', err.message);
+    return res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
+
+// Endpoint para atualizar apenas o plano alimentar
+app.put('/plano/:id/plano', authenticateJWT, async (req, res) => {
+  const user_id = req.user.id;
+  const plano_id = req.params.id;
+  const { plano: novoPlano } = req.body;
+  
+  if (!novoPlano) {
+    return res.status(400).json({ error: 'Dados do plano são obrigatórios.' });
+  }
+  
+  try {
+    // Verificar se o plano existe e pertence ao usuário
+    const { data: planoExistente, error: buscaError } = await supabase
+      .from('planos')
+      .select('id')
+      .eq('id', plano_id)
+      .eq('user_id', user_id)
+      .single();
+      
+    if (buscaError || !planoExistente) {
+      return res.status(404).json({ error: 'Plano não encontrado.' });
+    }
+    
+    // Atualizar apenas o plano alimentar
+    const { data: planoAtualizado, error: updateError } = await supabase
+      .from('planos')
+      .update({
+        plano: novoPlano,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', plano_id)
+      .eq('user_id', user_id)
+      .select('*')
+      .single();
+      
+    if (updateError) {
+      console.error('❌ Erro ao atualizar plano alimentar:', updateError);
+      return res.status(400).json({ error: updateError.message });
+    }
+    
+    return res.json({ plano: planoAtualizado, message: 'Plano alimentar atualizado com sucesso!' });
+  } catch (err) {
+    console.error('Erro ao atualizar plano alimentar:', err.message);
+    return res.status(500).json({ error: 'Erro interno do servidor.' });
   }
 });
 
